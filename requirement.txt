@@ -1,0 +1,27 @@
+# MCP 및 LangChain 관련 패키지
+mcp>=1.0.0
+langchain-mcp-adapters>=0.1.0
+langchain-openai>=0.1.0
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+# OpenSearch 클라이언트
+opensearch-py>=2.4.0
+
+# OpenAI 임베딩
+openai>=1.0.0
+
+# 환경 변수 관리
+python-dotenv>=1.0.0
+
+# 비동기 처리
+asyncio
+
+# JSON 처리 (Python 기본 포함)
+# json
+
+# SSL 처리 (Python 기본 포함)  
+# ssl
+
+# 타입 힌트 (Python 3.8+ 기본 포함)
+# typing
