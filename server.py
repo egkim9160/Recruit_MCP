@@ -4,6 +4,7 @@ import os
 import ssl
 import json
 import asyncio
+import logging
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -12,11 +13,41 @@ from opensearchpy import OpenSearch
 
 load_dotenv()
 
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,  # DEBUG에서 INFO로 변경하여 로그 간소화
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # 로그 레벨 환경변수가 소문자일 경우 대문자로 변경
 if os.getenv('LOG_LEVEL'):
     os.environ['LOG_LEVEL'] = os.getenv('LOG_LEVEL').upper()
 
 app = FastMCP("의료진 채용 검색 서버")
+
+# 도구 호출 추적을 위한 카운터
+tool_call_counter = {}
+
+def log_tool_call(tool_name: str, **kwargs):
+    """도구 호출 로깅 (간소화된 버전)"""
+    if tool_name not in tool_call_counter:
+        tool_call_counter[tool_name] = 0
+    tool_call_counter[tool_name] += 1
+    
+    logger.info(f"🔧 도구 호출 [{tool_name}] #{tool_call_counter[tool_name]}")
+    
+    # 벡터 필드나 긴 데이터는 간소화해서 로그
+    simplified_kwargs = {}
+    for key, value in kwargs.items():
+        if key == 'query_length' and value > 500:
+            simplified_kwargs[key] = f"{value}자 (긴 쿼리)"
+        elif isinstance(value, str) and len(value) > 100:
+            simplified_kwargs[key] = f"{value[:100]}... (총 {len(value)}자)"
+        else:
+            simplified_kwargs[key] = value
+    
+    logger.info(f"파라미터: {simplified_kwargs}")
 
 class OpenSearchService:
     def __init__(self, hosts=None, http_auth=None, use_ssl=True, verify_certs=False, ssl_show_warn=False, timeout=30):
@@ -40,6 +71,10 @@ class OpenSearchService:
         
         self.recruit_index = "recruit_text-embedding-3-small_1536_100000_300_20250529_150924"
         self.resume_index = "resume_text-embedding-3-large_3072_100000_300_20250221_175445"
+        
+        logger.info(f"OpenSearch 서비스 초기화 완료")
+        logger.info(f"공고 인덱스: {self.recruit_index}")
+        logger.info(f"이력서 인덱스: {self.resume_index}")
 
     def _connect(self, hosts, http_auth, use_ssl, verify_certs, ssl_show_warn, timeout):
         opensearch_host = os.getenv("OPENSEARCH_HOST", 'opensearch.medigate.net')
@@ -63,17 +98,24 @@ class OpenSearchService:
             timeout=timeout,
             ssl_context=ssl_context
         )
+        
+        logger.info(f"OpenSearch 연결 설정: {actual_hosts}")
 
     async def create_embedding(self, text: str) -> List[float]:
         try:
-            return await self.embeddings_model.aembed_query(text)
+            logger.info(f"임베딩 생성 요청: {text[:50]}...")
+            result = await self.embeddings_model.aembed_query(text)
+            logger.info(f"임베딩 생성 완료: 벡터 차원 {len(result)}")
+            return result
         except Exception as e:
-            print(f"임베딩 생성 오류: {e}")
+            logger.error(f"임베딩 생성 오류: {e}")
             return []
 
     def build_search_query(self, filter_conditions: Dict[str, Any], semantic_query: str = None, 
                           query_vector: List[float] = None, vector_field_name: str = "vector_field", 
                           default_knn_k: int = 10) -> Dict[str, Any]:
+        logger.info(f"검색 쿼리 생성 - 필터: {len(filter_conditions)}개, 벡터 사용: {bool(query_vector)}")
+        
         bool_query_parts = {
             "must": [],
             "filter": [],
@@ -83,6 +125,7 @@ class OpenSearchService:
 
         # 실제 필드 구조에 맞게 수정
         for field, value in filter_conditions.items():
+            logger.info(f"필터 추가: {field} = {value}")
             # metadata 안의 필드들로 변경
             if field == "region":
                 bool_query_parts["filter"].append({"term": {"metadata.REGION_NAME": value}})
@@ -91,37 +134,25 @@ class OpenSearchService:
                 bool_query_parts["filter"].append({"match": {"metadata.SPECIALTIES": value}})
             elif field == "salary":
                 if isinstance(value, dict):
-                    # 급여는 텍스트로 저장되어 있어서 범위 검색이 어려움
-                    # 일단 키워드 매칭으로 처리
                     if "gte" in value:
-                        bool_query_parts["must"].append({
-                            "script": {
-                                "script": {
-                                    "source": """
-                                    String payDetails = params._source.metadata.PAY_DETAILS;
-                                    if (payDetails == null) return false;
-                                    
-                                    // 숫자 추출 로직
-                                    Pattern pattern = Pattern.compile("(\\d+)만원");
-                                    Matcher matcher = pattern.matcher(payDetails);
-                                    if (matcher.find()) {
-                                        int salary = Integer.parseInt(matcher.group(1));
-                                        return salary >= params.min_salary;
-                                    }
-                                    return false;
-                                    """,
-                                    "params": {
-                                        "min_salary": value["gte"] // 10000  # 만원 단위로 변환
-                                    }
-                                }
-                            }
-                        })
+                        # 더 유연한 급여 검색 (부분 매칭)
+                        min_salary_num = value["gte"] // 10000  # 만원 단위
+                        bool_query_parts["should"].extend([
+                            {"match": {"metadata.PAY_DETAILS": f"{min_salary_num}만원"}},
+                            {"match": {"metadata.PAY_DETAILS": f"{min_salary_num}0만원"}},  # 3000만원
+                            {"match": {"metadata.PAY_DETAILS": f"{min_salary_num}00만원"}}, # 3000만원
+                            {"wildcard": {"metadata.PAY_DETAILS": f"*{min_salary_num}*"}}, # 와일드카드 검색
+                        ])
+                        # should 조건 중 최소 1개는 매칭되어야 함
+                        if "minimum_should_match" not in bool_query_parts:
+                            bool_query_parts["minimum_should_match"] = 1
             elif field == "employment_type":
                 bool_query_parts["filter"].append({"match": {"metadata.REGULAR_STATUS": value}})
             elif field == "hospital_name":
                 bool_query_parts["filter"].append({"match": {"metadata.ORGANIZATION_NAME": value}})
 
         if query_vector and vector_field_name:
+            logger.info(f"KNN 쿼리 추가: k={default_knn_k}")
             knn_clause = {
                 "knn": {
                     vector_field_name: {
@@ -138,15 +169,19 @@ class OpenSearchService:
             },
             "size": 20
         }
-
+        
+        logger.info(f"생성된 쿼리 크기: {len(json.dumps(query))} 문자")
         return query
 
     async def search(self, index_name: str, query: Dict[str, Any]) -> Dict[str, Any]:
         try:
+            logger.info(f"검색 실행: 인덱스 {index_name}")
             response = self.client.search(index=index_name, body=query)
+            total_hits = response["hits"]["total"]["value"]
+            logger.info(f"검색 완료: {total_hits}개 결과")
             return response
         except Exception as e:
-            print(f"검색 오류: {e}")
+            logger.error(f"검색 오류: {e}")
             return {"hits": {"hits": []}}
 
 os_service = OpenSearchService()
@@ -176,6 +211,11 @@ async def create_recruit_search_query(
     Returns:
         검색 쿼리 JSON 문자열
     """
+    log_tool_call("create_recruit_search_query", 
+                  region=region, department=department, min_salary=min_salary,
+                  max_salary=max_salary, experience_years=experience_years,
+                  employment_type=employment_type, semantic_keywords=semantic_keywords)
+    
     try:
         filter_conditions = {}
         
@@ -197,6 +237,7 @@ async def create_recruit_search_query(
 
         query_vector = None
         if semantic_keywords:
+            logger.info(f"의미 검색 키워드로 임베딩 생성: {semantic_keywords}")
             query_vector = await os_service.create_embedding(semantic_keywords)
 
         query = os_service.build_search_query(
@@ -205,10 +246,14 @@ async def create_recruit_search_query(
             query_vector=query_vector
         )
         
-        return json.dumps(query, ensure_ascii=False, indent=2)
+        result = json.dumps(query, ensure_ascii=False, indent=2)
+        logger.info(f"쿼리 생성 완료: {len(result)} 문자")
+        return result
     
     except Exception as e:
-        return f"쿼리 생성 오류: {str(e)}"
+        error_msg = f"쿼리 생성 오류: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg
 
 @app.tool()
 async def create_user_search_query(
@@ -231,6 +276,10 @@ async def create_user_search_query(
     Returns:
         검색 쿼리 JSON 문자열
     """
+    log_tool_call("create_user_search_query",
+                  user_id=user_id, department=department, experience_years=experience_years,
+                  preferred_region=preferred_region, semantic_keywords=semantic_keywords)
+    
     try:
         filter_conditions = {}
         
@@ -253,28 +302,57 @@ async def create_user_search_query(
             query_vector=query_vector
         )
         
-        return json.dumps(query, ensure_ascii=False, indent=2)
+        result = json.dumps(query, ensure_ascii=False, indent=2)
+        logger.info(f"사용자 쿼리 생성 완료: {len(result)} 문자")
+        return result
     
     except Exception as e:
-        return f"사용자 쿼리 생성 오류: {str(e)}"
+        error_msg = f"사용자 쿼리 생성 오류: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg
 
 @app.tool()
-async def search_recruits(query_json: str) -> str:
+async def search_recruits(query_json) -> str:
     """
     공고 데이터베이스에서 검색을 수행합니다.
     
     Args:
-        query_json: 검색 쿼리 JSON 문자열
+        query_json: 검색 쿼리 (JSON 문자열 또는 딕셔너리)
     
     Returns:
         검색 결과 JSON 문자열
     """
+    log_tool_call("search_recruits", query_type=type(query_json).__name__)
+    
     try:
-        query = json.loads(query_json)
+        # query_json의 타입에 따라 처리
+        if isinstance(query_json, str):
+            logger.info("문자열 쿼리 받음")
+            try:
+                query = json.loads(query_json)
+                logger.info("JSON 파싱 성공")
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON 파싱 오류: {e}")
+                return f"JSON 파싱 오류: {str(e)}"
+        elif isinstance(query_json, dict):
+            logger.info("딕셔너리 쿼리 받음")
+            query = query_json
+        else:
+            logger.error(f"지원하지 않는 쿼리 타입: {type(query_json)}")
+            return f"지원하지 않는 쿼리 타입: {type(query_json)}"
+        
+        # 쿼리가 완전한 형태인지 확인
+        if "query" not in query:
+            logger.warning("쿼리에 'query' 키가 없음. 래핑 시도...")
+            query = {"query": query, "size": 20}
+        
         result = await os_service.search(os_service.recruit_index, query)
         
         formatted_results = []
-        for hit in result["hits"]["hits"]:
+        hits = result["hits"]["hits"]
+        logger.info(f"원본 검색 결과: {len(hits)}개")
+        
+        for i, hit in enumerate(hits):
             source = hit["_source"]
             metadata = source.get("metadata", {})
             
@@ -286,6 +364,10 @@ async def search_recruits(query_json: str) -> str:
                 salary_match = re.search(r'(\d+)만원', pay_details)
                 if salary_match:
                     salary = int(salary_match.group(1)) * 10000  # 원 단위로 변환
+            
+            # 벡터 필드는 로그에서 제외 (너무 길어서)
+            if "vector_field" in source:
+                logger.debug(f"결과 {i+1}: 벡터 필드 포함 (1536차원)")
             
             formatted_result = {
                 "board_id": metadata.get("BOARD_IDX", hit["_id"]),
@@ -304,31 +386,49 @@ async def search_recruits(query_json: str) -> str:
             }
             formatted_results.append(formatted_result)
         
-        return json.dumps({
+        result_data = {
             "total_hits": result["hits"]["total"]["value"],
             "results": formatted_results
-        }, ensure_ascii=False, indent=2)
+        }
+        
+        result_json = json.dumps(result_data, ensure_ascii=False, indent=2)
+        logger.info(f"공고 검색 완료: {len(formatted_results)}개 포맷된 결과")
+        return result_json
     
     except Exception as e:
-        return f"공고 검색 오류: {str(e)}"
+        error_msg = f"공고 검색 오류: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg
 
 @app.tool()
-async def search_users(query_json: str) -> str:
+async def search_users(query_json) -> str:
     """
     사용자 데이터베이스에서 검색을 수행합니다.
     
     Args:
-        query_json: 검색 쿼리 JSON 문자열
+        query_json: 검색 쿼리 (JSON 문자열 또는 딕셔너리)
     
     Returns:
         검색 결과 JSON 문자열
     """
+    log_tool_call("search_users", query_type=type(query_json).__name__)
+    
     try:
-        query = json.loads(query_json)
+        # query_json의 타입에 따라 처리
+        if isinstance(query_json, str):
+            query = json.loads(query_json)
+        elif isinstance(query_json, dict):
+            query = query_json
+        else:
+            return f"지원하지 않는 쿼리 타입: {type(query_json)}"
+            
         result = await os_service.search(os_service.resume_index, query)
         
         formatted_results = []
-        for hit in result["hits"]["hits"]:
+        hits = result["hits"]["hits"]
+        logger.info(f"사용자 검색 결과: {len(hits)}개")
+        
+        for i, hit in enumerate(hits):
             source = hit["_source"]
             formatted_result = {
                 "user_id": hit["_id"],
@@ -341,13 +441,19 @@ async def search_users(query_json: str) -> str:
             }
             formatted_results.append(formatted_result)
         
-        return json.dumps({
+        result_data = {
             "total_hits": result["hits"]["total"]["value"],
             "results": formatted_results
-        }, ensure_ascii=False, indent=2)
+        }
+        
+        result_json = json.dumps(result_data, ensure_ascii=False, indent=2)
+        logger.info(f"사용자 검색 완료: {len(formatted_results)}개 결과")
+        return result_json
     
     except Exception as e:
-        return f"사용자 검색 오류: {str(e)}"
+        error_msg = f"사용자 검색 오류: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg
 
 @app.tool()
 async def get_recruit_by_id(board_id: str) -> str:
@@ -360,7 +466,10 @@ async def get_recruit_by_id(board_id: str) -> str:
     Returns:
         공고 정보 JSON 문자열
     """
+    log_tool_call("get_recruit_by_id", board_id=board_id)
+    
     try:
+        logger.info(f"공고 ID로 조회 시작: {board_id}")
         result = os_service.client.get(index=os_service.recruit_index, id=board_id)
         source = result["_source"]
         metadata = source.get("metadata", {})
@@ -391,38 +500,55 @@ async def get_recruit_by_id(board_id: str) -> str:
             "address": metadata.get("ADDRESS", "")
         }
         
-        return json.dumps(formatted_result, ensure_ascii=False, indent=2)
+        result_json = json.dumps(formatted_result, ensure_ascii=False, indent=2)
+        logger.info(f"공고 조회 완료: {board_id}")
+        return result_json
     
     except Exception as e:
-        return f"공고 조회 오류: {str(e)}"
+        error_msg = f"공고 조회 오류: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg
 
 @app.tool()
-async def format_results(results_json: str, format_type: str = "summary") -> str:
+async def format_results(results_json, format_type: str = "summary") -> str:
     """
     검색 결과를 지정된 형식으로 포맷팅합니다.
     
     Args:
-        results_json: 검색 결과 JSON 문자열
+        results_json: 검색 결과 (JSON 문자열 또는 딕셔너리)
         format_type: 포맷 타입 (summary, detailed, brief)
     
     Returns:
         포맷된 결과 문자열
     """
+    log_tool_call("format_results", format_type=format_type, 
+                  results_type=type(results_json).__name__)
+    
     try:
-        data = json.loads(results_json)
+        logger.info(f"결과 포맷팅 시작: {format_type} 형식")
+        
+        # results_json의 타입에 따라 처리
+        if isinstance(results_json, str):
+            data = json.loads(results_json)
+        elif isinstance(results_json, dict):
+            data = results_json
+        else:
+            return f"지원하지 않는 결과 타입: {type(results_json)}"
         
         if "results" not in data:
+            logger.warning("포맷팅할 결과가 없습니다.")
             return "포맷팅할 결과가 없습니다."
         
         results = data["results"]
         total_hits = data.get("total_hits", len(results))
+        logger.info(f"포맷팅 대상: {len(results)}개 결과")
         
         if format_type == "brief":
             output = f"총 {total_hits}개의 결과가 있습니다.\n\n"
             for i, result in enumerate(results[:5], 1):
                 if "hospital_name" in result:  # 공고 결과
                     output += f"{i}. {result.get('title', '제목 없음')} - {result.get('hospital_name', '병원명 없음')}\n"
-                    output += f"   📍 {result.get('region', '지역 없음')} | �� {result.get('salary', 0):,}만원\n\n"
+                    output += f"   📍 {result.get('region', '지역 없음')} | 💰 {result.get('salary', 0):,}원\n\n"
         
         elif format_type == "summary":
             output = f"📋 총 {total_hits}개의 검색 결과\n\n"
@@ -432,7 +558,7 @@ async def format_results(results_json: str, format_type: str = "summary") -> str
                     output += f"   병원: {result.get('hospital_name', '병원명 없음')}\n"
                     output += f"   진료과: {result.get('department', '진료과 없음')}\n"
                     output += f"   지역: {result.get('region', '지역 없음')}\n"
-                    output += f"   연봉: {result.get('salary', 0):,}만원\n"
+                    output += f"   연봉: {result.get('salary', 0):,}원\n"
                     output += f"   고용형태: {result.get('employment_type', '고용형태 없음')}\n\n"
         
         elif format_type == "detailed":
@@ -443,16 +569,31 @@ async def format_results(results_json: str, format_type: str = "summary") -> str
                     output += f"   병원명: {result.get('hospital_name', '병원명 없음')}\n"
                     output += f"   진료과: {result.get('department', '진료과 없음')}\n"
                     output += f"   지역: {result.get('region', '지역 없음')}\n"
-                    output += f"   연봉: {result.get('salary', 0):,}만원\n"
+                    output += f"   연봉: {result.get('salary', 0):,}원\n"
                     output += f"   고용형태: {result.get('employment_type', '고용형태 없음')}\n"
                     output += f"   요구경력: {result.get('required_experience', 0)}년\n"
                     output += f"   설명: {result.get('description', '설명 없음')}\n"
                     output += f"   공고ID: {result.get('board_id', 'ID 없음')}\n\n"
         
+        logger.info(f"포맷팅 완료: {len(output)} 문자")
         return output
     
     except Exception as e:
-        return f"포맷팅 오류: {str(e)}"
+        error_msg = f"포맷팅 오류: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return error_msg
 
 if __name__ == "__main__":
-    app.run(transport="stdio")
+    # 도구 호출 통계 출력
+    def print_tool_stats():
+        if tool_call_counter:
+            logger.info("=== 도구 호출 통계 ===")
+            for tool_name, count in tool_call_counter.items():
+                logger.info(f"{tool_name}: {count}회")
+        else:
+            logger.info("도구 호출이 없었습니다.")
+    
+    try:
+        app.run(transport="stdio")
+    finally:
+        print_tool_stats()
