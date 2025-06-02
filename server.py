@@ -3,7 +3,10 @@
 import os
 import ssl
 import json
-import asyncio
+import copy
+import re
+import logging
+import time # time 모듈 추가 (JSON 파일명 생성용)
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -12,446 +15,303 @@ from opensearchpy import OpenSearch
 
 load_dotenv()
 
-# 로그 레벨 환경변수가 소문자일 경우 대문자로 변경
-if os.getenv('LOG_LEVEL'):
-    os.environ['LOG_LEVEL'] = os.getenv('LOG_LEVEL').upper()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__) # server.py 내에서는 __name__ 사용
 
 app = FastMCP("의료진 채용 검색 서버")
 
 class OpenSearchService:
-    def __init__(self, hosts=None, http_auth=None, use_ssl=True, verify_certs=False, ssl_show_warn=False, timeout=30):
-        load_dotenv()
-        
-        # OpenAI API 키 설정
+    def __init__(self):
         openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            raise ValueError("OPENAI_API_KEY가 환경변수에 설정되지 않았습니다.")
+        if not openai_api_key: raise ValueError("OPENAI_API_KEY가 환경변수에 설정되지 않았습니다.")
         
-        os.environ["OPENAI_API_KEY"] = openai_api_key
-        
-        self.client = None
-        self._connect(hosts, http_auth, use_ssl, verify_certs, ssl_show_warn, timeout)
-        
-        self.embeddings_model = OpenAIEmbeddings(
-            model="text-embedding-3-small",
-            request_timeout=30,
-            openai_api_key=openai_api_key
-        )
-        
+        self._connect()
+        self.embeddings_model = OpenAIEmbeddings(model="text-embedding-3-small", request_timeout=30, openai_api_key=openai_api_key)
         self.recruit_index = "recruit_text-embedding-3-small_1536_100000_300_20250529_150924"
         self.resume_index = "resume_text-embedding-3-large_3072_100000_300_20250221_175445"
 
-    def _connect(self, hosts, http_auth, use_ssl, verify_certs, ssl_show_warn, timeout):
+    def _connect(self):
         opensearch_host = os.getenv("OPENSEARCH_HOST", 'opensearch.medigate.net')
         opensearch_port = int(os.getenv("OPENSEARCH_PORT", 9200))
         opensearch_user = os.getenv("OPENSEARCH_USER", 'medigate')
         opensearch_password = os.getenv("OPENSEARCH_PASSWORD", 'Soakaeofh12!@')
-
-        actual_hosts = hosts or [{'host': opensearch_host, 'port': opensearch_port}]
-        actual_auth = http_auth or (opensearch_user, opensearch_password)
 
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
         self.client = OpenSearch(
-            hosts=actual_hosts,
-            http_auth=actual_auth,
-            use_ssl=use_ssl,
-            verify_certs=verify_certs,
-            ssl_show_warn=ssl_show_warn,
-            timeout=timeout,
-            ssl_context=ssl_context
+            hosts=[{'host': opensearch_host, 'port': opensearch_port}],
+            http_auth=(opensearch_user, opensearch_password),
+            use_ssl=True, verify_certs=False, ssl_show_warn=False, timeout=30, ssl_context=ssl_context
         )
 
     async def create_embedding(self, text: str) -> List[float]:
         try:
             return await self.embeddings_model.aembed_query(text)
         except Exception as e:
-            print(f"임베딩 생성 오류: {e}")
+            logger.error(f"임베딩 생성 오류: {e}")
             return []
-
-    def build_search_query(self, filter_conditions: Dict[str, Any], semantic_query: str = None, 
-                          query_vector: List[float] = None, vector_field_name: str = "vector_field", 
-                          default_knn_k: int = 10) -> Dict[str, Any]:
-        bool_query_parts = {
-            "must": [],
-            "filter": [],
-            "should": [],
-            "must_not": []
-        }
-
-        # 실제 필드 구조에 맞게 수정
-        for field, value in filter_conditions.items():
-            # metadata 안의 필드들로 변경
-            if field == "region":
-                bool_query_parts["filter"].append({"term": {"metadata.REGION_NAME": value}})
-            elif field == "department":
-                # SPECIALTIES 필드에서 해당 진료과 검색
-                bool_query_parts["filter"].append({"match": {"metadata.SPECIALTIES": value}})
-            elif field == "salary":
-                if isinstance(value, dict):
-                    # 급여는 텍스트로 저장되어 있어서 범위 검색이 어려움
-                    # 일단 키워드 매칭으로 처리
-                    if "gte" in value:
-                        bool_query_parts["must"].append({
-                            "script": {
-                                "script": {
-                                    "source": """
-                                    String payDetails = params._source.metadata.PAY_DETAILS;
-                                    if (payDetails == null) return false;
-                                    
-                                    // 숫자 추출 로직
-                                    Pattern pattern = Pattern.compile("(\\d+)만원");
-                                    Matcher matcher = pattern.matcher(payDetails);
-                                    if (matcher.find()) {
-                                        int salary = Integer.parseInt(matcher.group(1));
-                                        return salary >= params.min_salary;
-                                    }
-                                    return false;
-                                    """,
-                                    "params": {
-                                        "min_salary": value["gte"] // 10000  # 만원 단위로 변환
-                                    }
-                                }
-                            }
-                        })
-            elif field == "employment_type":
-                bool_query_parts["filter"].append({"match": {"metadata.REGULAR_STATUS": value}})
-            elif field == "hospital_name":
-                bool_query_parts["filter"].append({"match": {"metadata.ORGANIZATION_NAME": value}})
-
-        if query_vector and vector_field_name:
-            knn_clause = {
-                "knn": {
-                    vector_field_name: {
-                        "vector": query_vector,
-                        "k": default_knn_k
-                    }
-                }
-            }
-            bool_query_parts["must"].append(knn_clause)
-
-        query = {
-            "query": {
-                "bool": bool_query_parts
-            },
-            "size": 20
-        }
-
+    
+    def build_filter_conditions(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        filter_clauses = []
+        for field, value in filters.items():
+            if field == "region" and value: filter_clauses.append({"wildcard": {"metadata.REGION_NAME": f"*{value}*"}})
+            elif field == "department" and value: filter_clauses.append({"wildcard": {"metadata.SPECIALTIES": f"*{value}*"}})
+            # employment_type 필터는 이전 요청에 의해 주석 처리된 상태로 유지
+            # elif field == "employment_type" and value: filter_clauses.append({"wildcard": {"metadata.REGULAR_STATUS": f"*{value}*"}})
+            elif field == "hospital_name" and value: filter_clauses.append({"wildcard": {"metadata.ORGANIZATION_NAME": f"*{value}*"}})
+        return filter_clauses
+    
+    def build_search_query(self, index_hint: str, filters: Dict[str, Any] = None, semantic_query: str = None, query_vector: List[float] = None, exclude_filters: List[Dict[str, Any]] = None, size: int = 10) -> Dict[str, Any]:
+        query = {"size": min(size, 50), "_source": {"excludes": ["vector_field"]}}
+        bool_query = {"must": [], "filter": [], "should": [], "must_not": []}
+        
+        if filters: bool_query["filter"].extend(self.build_filter_conditions(filters))
+        if exclude_filters: bool_query["must_not"].extend(exclude_filters)
+        if query_vector: bool_query["must"].append({"knn": {"vector_field": {"vector": query_vector, "k": 10}}})
+        if semantic_query and not query_vector: bool_query["must"].append({"multi_match": {"query": semantic_query, "fields": ["text", "metadata.*"]}})
+        
+        query["query"] = {"bool": bool_query} if any(bool_query.values()) else {"match_all": {}}
         return query
 
-    async def search(self, index_name: str, query: Dict[str, Any]) -> Dict[str, Any]:
+    def _create_logging_query(self, query: Dict[str, Any]) -> Dict[str, Any]:
+        logging_query = copy.deepcopy(query)
+        if "query" in logging_query and "bool" in logging_query["query"]:
+            bool_clauses = logging_query["query"]["bool"]
+            for clause_type in ["must", "should"]:
+                if clause_type in bool_clauses:
+                    for i, condition in enumerate(bool_clauses[clause_type]):
+                        if "knn" in condition:
+                            for knn_field_name, knn_field_content in condition["knn"].items():
+                                if isinstance(knn_field_content, dict) and "vector" in knn_field_content and isinstance(knn_field_content["vector"], list):
+                                    vector_length = len(knn_field_content["vector"])
+                                    logging_query["query"]["bool"][clause_type][i]["knn"][knn_field_name]["vector"] = f"<{vector_length}차원 벡터 데이터 생략>"
+        return logging_query
+
+    async def search(self, index_hint: str, query: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            response = self.client.search(index=index_name, body=query)
-            return response
+            index_name = self.recruit_index if index_hint in ["recruit", "job", "board"] else self.resume_index if index_hint in ["user", "resume", "profile"] else index_hint
+            
+            logging_query = self._create_logging_query(query)
+            logger.info(f"OpenSearch Query to index '{index_name}':\n{json.dumps(logging_query, ensure_ascii=False, indent=2)}")
+            
+            return self.client.search(index=index_name, body=query)
         except Exception as e:
-            print(f"검색 오류: {e}")
-            return {"hits": {"hits": []}}
+            logger.error(f"OpenSearch 검색 오류: {e}", exc_info=True)
+            return {"hits": {"hits": [], "total": {"value": 0}}}
 
 os_service = OpenSearchService()
 
 @app.tool()
-async def create_recruit_search_query(
-    region: str = None,
-    department: str = None,
-    min_salary: int = None,
-    max_salary: int = None,
-    experience_years: int = None,
-    employment_type: str = None,
-    semantic_keywords: str = None
-) -> str:
-    """
-    공고 검색을 위한 쿼리를 생성합니다.
-    
-    Args:
-        region: 지역 (예: 서울, 부산)
-        department: 진료과목 (예: 마취통증의학과, 내과)
-        min_salary: 최소 연봉 (단위: 만원)
-        max_salary: 최대 연봉 (단위: 만원)
-        experience_years: 경력 연수
-        employment_type: 고용형태 (정규직, 계약직 등)
-        semantic_keywords: 의미론적 검색 키워드 (예: 초음파, 내시경)
-    
-    Returns:
-        검색 쿼리 JSON 문자열
-    """
+async def get_board_by_id(board_id: str) -> str:
+    logger.info(f"도구 실행: get_board_by_id, ID: {board_id}")
     try:
-        filter_conditions = {}
+        search_query = {"query": {"term": {"metadata.BOARD_IDX": board_id}}, "size": 1, "_source": {"excludes": ["vector_field"]}}
+        result = await os_service.search("recruit", search_query)
+        if not result["hits"]["hits"]: return json.dumps({"success": False, "error": f"공고 ID {board_id} 없음"}, ensure_ascii=False)
         
-        if region:
-            filter_conditions["region"] = region
-        if department:
-            filter_conditions["department"] = department
-        if min_salary or max_salary:
-            salary_range = {}
-            if min_salary:
-                salary_range["gte"] = min_salary * 10000
-            if max_salary:
-                salary_range["lte"] = max_salary * 10000
-            filter_conditions["salary"] = salary_range
-        if experience_years is not None:
-            filter_conditions["required_experience"] = {"lte": experience_years}
-        if employment_type:
-            filter_conditions["employment_type"] = employment_type
-
-        query_vector = None
-        if semantic_keywords:
-            query_vector = await os_service.create_embedding(semantic_keywords)
-
-        query = os_service.build_search_query(
-            filter_conditions=filter_conditions,
-            semantic_query=semantic_keywords,
-            query_vector=query_vector
-        )
+        hit = result["hits"]["hits"][0]; source = hit["_source"]; metadata = source.get("metadata", {}); text_content = source.get("text", "")
+        title = text_content.split("||")[0].replace("TITLE => ", "").strip() if "TITLE =>" in text_content else ""
         
-        return json.dumps(query, ensure_ascii=False, indent=2)
-    
-    except Exception as e:
-        return f"쿼리 생성 오류: {str(e)}"
-
-@app.tool()
-async def create_user_search_query(
-    user_id: str = None,
-    department: str = None,
-    experience_years: int = None,
-    preferred_region: str = None,
-    semantic_keywords: str = None
-) -> str:
-    """
-    사용자 기반 검색을 위한 쿼리를 생성합니다.
-    
-    Args:
-        user_id: 사용자 ID
-        department: 전문과목
-        experience_years: 경력 연수
-        preferred_region: 선호 지역
-        semantic_keywords: 의미론적 검색 키워드
-    
-    Returns:
-        검색 쿼리 JSON 문자열
-    """
-    try:
-        filter_conditions = {}
-        
-        if user_id:
-            filter_conditions["user_id"] = user_id
-        if department:
-            filter_conditions["department"] = department
-        if experience_years is not None:
-            filter_conditions["experience_years"] = {"gte": experience_years}
-        if preferred_region:
-            filter_conditions["preferred_region"] = preferred_region
-
-        query_vector = None
-        if semantic_keywords:
-            query_vector = await os_service.create_embedding(semantic_keywords)
-
-        query = os_service.build_search_query(
-            filter_conditions=filter_conditions,
-            semantic_query=semantic_keywords,
-            query_vector=query_vector
-        )
-        
-        return json.dumps(query, ensure_ascii=False, indent=2)
-    
-    except Exception as e:
-        return f"사용자 쿼리 생성 오류: {str(e)}"
-
-@app.tool()
-async def search_recruits(query_json: str) -> str:
-    """
-    공고 데이터베이스에서 검색을 수행합니다.
-    
-    Args:
-        query_json: 검색 쿼리 JSON 문자열
-    
-    Returns:
-        검색 결과 JSON 문자열
-    """
-    try:
-        query = json.loads(query_json)
-        result = await os_service.search(os_service.recruit_index, query)
-        
-        formatted_results = []
-        for hit in result["hits"]["hits"]:
-            source = hit["_source"]
-            metadata = source.get("metadata", {})
-            
-            # 급여에서 숫자 추출
-            salary = 0
-            pay_details = metadata.get("PAY_DETAILS", "")
-            if pay_details:
-                import re
-                salary_match = re.search(r'(\d+)만원', pay_details)
-                if salary_match:
-                    salary = int(salary_match.group(1)) * 10000  # 원 단위로 변환
-            
-            formatted_result = {
-                "board_id": metadata.get("BOARD_IDX", hit["_id"]),
-                "score": hit["_score"],
-                "title": source.get("text", "").split("||")[0].replace("TITLE => ", "").strip() if "TITLE =>" in source.get("text", "") else "",
-                "hospital_name": metadata.get("ORGANIZATION_NAME", ""),
-                "department": metadata.get("SPECIALTIES", ""),
-                "region": metadata.get("REGION_NAME", ""),
-                "salary": salary,
-                "employment_type": metadata.get("REGULAR_STATUS", ""),
-                "required_experience": 0,  # 이 필드는 없는 것 같음
-                "description": source.get("text", "")[:200] + "..." if len(source.get("text", "")) > 200 else source.get("text", ""),
-                "pay_details": pay_details,
-                "work_hours": metadata.get("WORK_HOUR_DETAILS", ""),
-                "address": metadata.get("ADDRESS", "")
-            }
-            formatted_results.append(formatted_result)
-        
-        return json.dumps({
-            "total_hits": result["hits"]["total"]["value"],
-            "results": formatted_results
-        }, ensure_ascii=False, indent=2)
-    
-    except Exception as e:
-        return f"공고 검색 오류: {str(e)}"
-
-@app.tool()
-async def search_users(query_json: str) -> str:
-    """
-    사용자 데이터베이스에서 검색을 수행합니다.
-    
-    Args:
-        query_json: 검색 쿼리 JSON 문자열
-    
-    Returns:
-        검색 결과 JSON 문자열
-    """
-    try:
-        query = json.loads(query_json)
-        result = await os_service.search(os_service.resume_index, query)
-        
-        formatted_results = []
-        for hit in result["hits"]["hits"]:
-            source = hit["_source"]
-            formatted_result = {
-                "user_id": hit["_id"],
-                "score": hit["_score"],
-                "department": source.get("department", ""),
-                "experience_years": source.get("experience_years", 0),
-                "preferred_region": source.get("preferred_region", ""),
-                "applied_jobs": source.get("applied_jobs", []),
-                "skills": source.get("skills", [])
-            }
-            formatted_results.append(formatted_result)
-        
-        return json.dumps({
-            "total_hits": result["hits"]["total"]["value"],
-            "results": formatted_results
-        }, ensure_ascii=False, indent=2)
-    
-    except Exception as e:
-        return f"사용자 검색 오류: {str(e)}"
-
-@app.tool()
-async def get_recruit_by_id(board_id: str) -> str:
-    """
-    특정 공고 ID로 공고 정보를 조회합니다.
-    
-    Args:
-        board_id: 공고 ID
-    
-    Returns:
-        공고 정보 JSON 문자열
-    """
-    try:
-        result = os_service.client.get(index=os_service.recruit_index, id=board_id)
-        source = result["_source"]
-        metadata = source.get("metadata", {})
-        
-        # 급여에서 숫자 추출
-        salary = 0
-        pay_details = metadata.get("PAY_DETAILS", "")
-        if pay_details:
-            import re
-            salary_match = re.search(r'(\d+)만원', pay_details)
-            if salary_match:
-                salary = int(salary_match.group(1)) * 10000
-        
-        formatted_result = {
-            "board_id": metadata.get("BOARD_IDX", board_id),
-            "title": source.get("text", "").split("||")[0].replace("TITLE => ", "").strip() if "TITLE =>" in source.get("text", "") else "",
-            "hospital_name": metadata.get("ORGANIZATION_NAME", ""),
-            "department": metadata.get("SPECIALTIES", ""),
-            "region": metadata.get("REGION_NAME", ""),
-            "salary": salary,
-            "employment_type": metadata.get("REGULAR_STATUS", ""),
-            "required_experience": 0,
-            "description": source.get("text", ""),
-            "benefits": metadata.get("MEAL_HOUSE_STATUS", ""),
-            "requirements": metadata.get("LABOR_LAW_STATUS", ""),
-            "pay_details": pay_details,
-            "work_hours": metadata.get("WORK_HOUR_DETAILS", ""),
-            "address": metadata.get("ADDRESS", "")
-        }
-        
+        formatted_result = {"success": True, "data": {
+            "board_id": metadata.get("BOARD_IDX", board_id), "title": title, "hospital_name": metadata.get("ORGANIZATION_NAME", ""),
+            "department": metadata.get("SPECIALTIES", ""), "region": metadata.get("REGION_NAME", ""), 
+            "employment_type": metadata.get("REGULAR_STATUS", ""), # REGULAR_STATUS 또는 WORK_TYPE. 현재 build_filter_conditions에서는 employment_type 필터 주석처리됨.
+            "work_type_actual": metadata.get("WORK_TYPE", ""), # 실제 공고의 WORK_TYPE
+            "pay_details": metadata.get("PAY_DETAILS", ""), "work_hours": metadata.get("WORK_HOUR_DETAILS", ""), 
+            "address": metadata.get("ADDRESS", ""), "benefits": metadata.get("MEAL_HOUSE_STATUS", ""), 
+            "description": text_content[:500] + "..." if len(text_content) > 500 else text_content
+        }}
+        logger.info(f"get_board_by_id 성공: ID {board_id}")
         return json.dumps(formatted_result, ensure_ascii=False, indent=2)
-    
     except Exception as e:
-        return f"공고 조회 오류: {str(e)}"
+        logger.error(f"get_board_by_id 오류: {e}", exc_info=True)
+        return json.dumps({"success": False, "error": f"공고 조회 오류: {str(e)}"}, ensure_ascii=False)
 
 @app.tool()
-async def format_results(results_json: str, format_type: str = "summary") -> str:
-    """
-    검색 결과를 지정된 형식으로 포맷팅합니다.
-    
-    Args:
-        results_json: 검색 결과 JSON 문자열
-        format_type: 포맷 타입 (summary, detailed, brief)
-    
-    Returns:
-        포맷된 결과 문자열
-    """
+async def get_user_by_id(user_id: str) -> str:
+    logger.info(f"도구 실행: get_user_by_id, ID: {user_id}")
     try:
-        data = json.loads(results_json)
+        search_query = {"query": {"term": {"metadata.U_ID": user_id}}, "size": 1, "_source": {"excludes": ["vector_field"]}}
+        result = await os_service.search("user", search_query)
+        if not result["hits"]["hits"]: return json.dumps({"success": False, "error": f"사용자 ID {user_id} 없음"}, ensure_ascii=False)
         
-        if "results" not in data:
-            return "포맷팅할 결과가 없습니다."
+        hit = result["hits"]["hits"][0]; metadata = hit["_source"]["metadata"]; profile_text = hit["_source"].get("text", "")
+        formatted_result = {"success": True, "data": {
+            "user_id": metadata.get("U_ID", user_id), "department": metadata.get("SPECIALTY", ""),
+            "preferred_region": metadata.get("HOPE_LOCATION", ""), "experience_level": metadata.get("EXPERIENCE", ""),
+            "work_type": metadata.get("WORK_TYPE",""), # 사용자 프로필의 WORK_TYPE
+            "profile_text": profile_text[:300] + "..." if len(profile_text) > 300 else profile_text
+        }}
+        logger.info(f"get_user_by_id 성공: ID {user_id}")
+        return json.dumps(formatted_result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"get_user_by_id 오류: {e}", exc_info=True)
+        return json.dumps({"success": False, "error": f"사용자 조회 오류: {str(e)}"}, ensure_ascii=False)
+
+@app.tool()
+async def create_and_search_recruits(
+    region: str = None, department: str = None, employment_type: str = None, 
+    hospital_name: str = None, semantic_keywords: str = None, 
+    exclude_board_id: str = None, size: int = 10
+) -> str:
+    params = locals()
+    log_params = {k:v for k,v in params.items() if v is not None and k != 'semantic_keywords'}
+    if semantic_keywords: log_params['semantic_keywords_present'] = True
+    logger.info(f"도구 실행: create_and_search_recruits, Params: {log_params}")
+    try:
+        filters = {k:v for k,v in {"region":region, "department":department, 
+                                   "employment_type":employment_type, 
+                                   "hospital_name":hospital_name}.items() if v}
+        exclude_filters = [{"term": {"metadata.BOARD_IDX": exclude_board_id}}] if exclude_board_id else []
+        query_vector = await os_service.create_embedding(semantic_keywords) if semantic_keywords else None
         
-        results = data["results"]
-        total_hits = data.get("total_hits", len(results))
+        query = os_service.build_search_query("recruit", filters, semantic_keywords, query_vector, exclude_filters, size)
+        result = await os_service.search("recruit", query)
+        
+        formatted_results = []; board_ids = []
+        t1=result["hits"]["hits"]
+        logger.info(f"💾 Board IDs 저장됨: {t1}")
+        for hit in result["hits"]["hits"]:
+            source = hit["_source"]; metadata = source.get("metadata", {}); text_content = source.get("text", "")
+            title = text_content.split("||")[0].replace("TITLE => ", "").strip() if "TITLE =>" in text_content else ""
+            board_id_val = metadata.get("BOARD_IDX", hit["_id"]); board_ids.append(board_id_val)
+            
+            formatted_results.append({
+                "board_id": board_id_val, "title": title, 
+                "hospital_name": metadata.get("ORGANIZATION_NAME", ""),
+                "department": metadata.get("SPECIALTIES", ""), "region": metadata.get("REGION_NAME", ""), 
+                "employment_type": metadata.get("REGULAR_STATUS", ""), # build_filter_conditions 주석과 일치하도록. 만약 WORK_TYPE으로 필터링한다면 이것도 WORK_TYPE으로.
+                "work_type_actual": metadata.get("WORK_TYPE",""), # 실제 공고의 WORK_TYPE 정보도 제공
+                "pay_details": metadata.get("PAY_DETAILS", ""), 
+                "description": text_content[:100] + "..." if len(text_content) > 100 else text_content
+            })
+            logger.info(f"t2: {formatted_results}")
+        
+        result_data = {
+            "success": True, "total_hits": result["hits"]["total"]["value"], 
+            "results": formatted_results, "board_ids": board_ids
+        }
+        logger.info(f"t3: {result_data}")
+        
+        try:
+            board_ids_data = {
+                "search_timestamp": time.time(),
+                "search_params": {
+                    "region": region, "department": department, "employment_type": employment_type,
+                    "hospital_name": hospital_name, "semantic_keywords_present": bool(semantic_keywords),
+                    "exclude_board_id": exclude_board_id, "size": size
+                },
+                "total_results_returned": len(board_ids),
+                "board_ids": board_ids
+            }
+            logger.info(f"t4: {board_ids_data}")
+            filename = f"search_results_board_ids_{int(time.time())}.json"
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(board_ids_data, f, ensure_ascii=False, indent=2)
+            logger.info(f"💾 Board IDs 저장됨: {filename}")
+        except Exception as e:
+            logger.error(f"❌ JSON 파일 저장 오류: {e}")
+        
+        logger.info(f"create_and_search_recruits 성공: 반환된 결과 {len(formatted_results)}개 (총 검색 {result['hits']['total']['value']}개)")
+        return json.dumps(result_data, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"create_and_search_recruits 오류: {e}", exc_info=True)
+        return json.dumps({"success": False, "error": f"공고 검색 오류: {str(e)}"}, ensure_ascii=False)
+
+@app.tool()
+async def create_and_search_users(department: str = None, preferred_region: str = None, semantic_keywords: str = None, size: int = 10) -> str:
+    params = locals(); log_params = {k:v for k,v in params.items() if v is not None and k != 'semantic_keywords'}
+    if semantic_keywords: log_params['semantic_keywords_present'] = True
+    logger.info(f"도구 실행: create_and_search_users, Params: {log_params}")
+    try:
+        user_query_bool_filter = []
+        if department: user_query_bool_filter.append({"wildcard": {"metadata.SPECIALTY": f"*{department}*"}})
+        if preferred_region: user_query_bool_filter.append({"wildcard": {"metadata.HOPE_LOCATION": f"*{preferred_region}*"}})
+        user_query_bool_must = []
+        if semantic_keywords:
+            query_vector = await os_service.create_embedding(semantic_keywords)
+            if query_vector: user_query_bool_must.append({"knn": {"vector_field": {"vector": query_vector, "k": 10}}})
+
+        user_query_body = {"size": min(size, 50), "_source": {"excludes": ["vector_field"]}}
+        user_query_bool_conditions = {}
+        if user_query_bool_filter: user_query_bool_conditions["filter"] = user_query_bool_filter
+        if user_query_bool_must: user_query_bool_conditions["must"] = user_query_bool_must
+        user_query_body["query"] = {"bool": user_query_bool_conditions} if user_query_bool_conditions else {"match_all": {}}
+        
+        result = await os_service.search("user", user_query_body)
+        formatted_results = []
+        for hit in result["hits"]["hits"]:
+            source = hit["_source"]; metadata = source.get("metadata", {}); profile_text = source.get("text", "")
+            formatted_results.append({
+                "user_id": metadata.get("U_ID", hit["_id"]), "department": metadata.get("SPECIALTY", ""),
+                "preferred_region": metadata.get("HOPE_LOCATION", ""), "experience_level": metadata.get("EXPERIENCE", ""),
+                "work_type": metadata.get("WORK_TYPE",""),
+                "profile_text": profile_text[:200] + "..." if len(profile_text) > 200 else profile_text
+            })
+        result_data = {"success": True, "total_hits": result["hits"]["total"]["value"], "results": formatted_results}
+        logger.info(f"create_and_search_users 성공: {len(formatted_results)}개 결과")
+        return json.dumps(result_data, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"create_and_search_users 오류: {e}", exc_info=True)
+        return json.dumps({"success": False, "error": f"사용자 검색 오류: {str(e)}"}, ensure_ascii=False)
+
+@app.tool()
+async def format_search_results(results_json, format_type: str = "summary") -> str:
+    logger.info(f"도구 실행: format_search_results, Type: {format_type}, Input size: {len(str(results_json))}")
+    try:
+        data = json.loads(results_json) if isinstance(results_json, str) else results_json if isinstance(results_json, dict) else None
+        if not data or not data.get("success", False) or "results" not in data: return "포맷팅할 결과가 없거나 유효하지 않습니다."
+        results = data["results"]; total_hits = data.get("total_hits", len(results)); output_lines = []
         
         if format_type == "brief":
-            output = f"총 {total_hits}개의 결과가 있습니다.\n\n"
-            for i, result in enumerate(results[:5], 1):
-                if "hospital_name" in result:  # 공고 결과
-                    output += f"{i}. {result.get('title', '제목 없음')} - {result.get('hospital_name', '병원명 없음')}\n"
-                    output += f"   📍 {result.get('region', '지역 없음')} | �� {result.get('salary', 0):,}만원\n\n"
-        
+            output_lines.append(f"총 {total_hits}개의 결과 요약 (최대 5개 표시):")
+            for i, r in enumerate(results[:5], 1):
+                if "hospital_name" in r: output_lines.append(f"{i}. {r.get('title', 'N/A')} - {r.get('hospital_name', 'N/A')} ({r.get('region', 'N/A')}|{r.get('employment_type', 'N/A')})")
+                else: output_lines.append(f"{i}. 사용자 {r.get('user_id', 'N/A')} ({r.get('preferred_region', 'N/A')}|{r.get('department', 'N/A')})")
         elif format_type == "summary":
-            output = f"📋 총 {total_hits}개의 검색 결과\n\n"
-            for i, result in enumerate(results[:10], 1):
-                if "hospital_name" in result:  # 공고 결과
-                    output += f"🏥 {i}. {result.get('title', '제목 없음')}\n"
-                    output += f"   병원: {result.get('hospital_name', '병원명 없음')}\n"
-                    output += f"   진료과: {result.get('department', '진료과 없음')}\n"
-                    output += f"   지역: {result.get('region', '지역 없음')}\n"
-                    output += f"   연봉: {result.get('salary', 0):,}만원\n"
-                    output += f"   고용형태: {result.get('employment_type', '고용형태 없음')}\n\n"
-        
-        elif format_type == "detailed":
-            output = f"📋 상세 검색 결과 (총 {total_hits}개)\n\n"
-            for i, result in enumerate(results[:5], 1):
-                if "hospital_name" in result:  # 공고 결과
-                    output += f"🏥 {i}. {result.get('title', '제목 없음')}\n"
-                    output += f"   병원명: {result.get('hospital_name', '병원명 없음')}\n"
-                    output += f"   진료과: {result.get('department', '진료과 없음')}\n"
-                    output += f"   지역: {result.get('region', '지역 없음')}\n"
-                    output += f"   연봉: {result.get('salary', 0):,}만원\n"
-                    output += f"   고용형태: {result.get('employment_type', '고용형태 없음')}\n"
-                    output += f"   요구경력: {result.get('required_experience', 0)}년\n"
-                    output += f"   설명: {result.get('description', '설명 없음')}\n"
-                    output += f"   공고ID: {result.get('board_id', 'ID 없음')}\n\n"
-        
+            output_lines.append(f"총 {total_hits}개의 검색 결과 요약 (최대 10개 표시):")
+            for i, r in enumerate(results[:10], 1):
+                is_recruit = "hospital_name" in r
+                emp_type_key = "employment_type" if is_recruit else "work_type" 
+                if is_recruit:
+                    output_lines.append(f"\n🏥 {i}. {r.get('title', 'N/A')} (ID: {r.get('board_id', 'N/A')})")
+                    output_lines.extend([f"   - 병원: {r.get('hospital_name', 'N/A')}, 지역: {r.get('region', 'N/A')}", 
+                                         f"   - 진료과: {r.get('department', 'N/A')}, 고용: {r.get(emp_type_key, 'N/A')}", # 공고의 employment_type
+                                         f"   - 실제 근무유형(공고): {r.get('work_type_actual', 'N/A')}", # 공고의 work_type_actual 추가
+                                         f"   - 급여: {r.get('pay_details', 'N/A')}"])
+                else: # 사용자 결과
+                    output_lines.append(f"\n👤 {i}. 사용자 {r.get('user_id', 'N/A')}")
+                    output_lines.extend([f"   - 전문: {r.get('department', 'N/A')}, 선호지역: {r.get('preferred_region', 'N/A')}", 
+                                         f"   - 경력: {r.get('experience_level', 'N/A')}, 근무유형(사용자): {r.get(emp_type_key, 'N/A')}"]) # 사용자의 work_type
+        else: # detailed
+            output_lines.append(f"상세 검색 결과 (총 {total_hits}개, 최대 5개 표시):")
+            for i, r in enumerate(results[:5], 1):
+                is_recruit = "hospital_name" in r
+                emp_type_key = "employment_type" if is_recruit else "work_type"
+                if is_recruit:
+                    output_lines.append(f"\n🏥 {i}. {r.get('title', 'N/A')} (ID: {r.get('board_id', 'N/A')})")
+                    output_lines.extend([
+                        f"   - 병원명: {r.get('hospital_name', 'N/A')}, 진료과: {r.get('department', 'N/A')}",
+                        f"   - 지역: {r.get('region', 'N/A')}, 고용형태: {r.get(emp_type_key, 'N/A')}",
+                        f"   - 실제 근무유형(공고): {r.get('work_type_actual', 'N/A')}",
+                        f"   - 급여: {r.get('pay_details', 'N/A')}, 근무시간: {r.get('work_hours', '정보 없음')}", 
+                        f"   - 주소: {r.get('address', '정보 없음')}", 
+                        f"   - 설명: {r.get('description', 'N/A')}"
+                    ])
+                else: # 사용자 결과
+                    output_lines.append(f"\n👤 {i}. 사용자 {r.get('user_id', 'N/A')}")
+                    output_lines.extend([
+                        f"   - 전문과목: {r.get('department', 'N/A')}, 선호지역: {r.get('preferred_region', 'N/A')}",
+                        f"   - 경력: {r.get('experience_level', 'N/A')}, 근무유형(사용자): {r.get(emp_type_key, 'N/A')}",
+                        f"   - 프로필: {r.get('profile_text', 'N/A')}"
+                    ])
+        output = "\n".join(output_lines)
+        logger.info(f"format_search_results 성공, Output size: {len(output)}")
         return output
-    
     except Exception as e:
+        logger.error(f"format_search_results 오류: {e}", exc_info=True)
         return f"포맷팅 오류: {str(e)}"
 
 if __name__ == "__main__":
