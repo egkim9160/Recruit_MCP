@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 app = FastMCP("의료진 채용 검색 서버")
 
-# 토큰 계산용 인코더 초기화 (GPT-4 기준)
 try:
     token_encoder = tiktoken.encoding_for_model("gpt-4")
 except Exception as e:
@@ -29,12 +28,11 @@ except Exception as e:
     token_encoder = tiktoken.get_encoding("cl100k_base")
 
 def calculate_tokens(text: str) -> int:
-    """텍스트의 토큰 수를 계산합니다."""
     try:
         return len(token_encoder.encode(text))
     except Exception as e:
         logger.error(f"토큰 계산 오류: {e}")
-        return len(text.split()) # 대략적인 단어 수로 대체
+        return len(text.split()) 
 
 class OpenSearchService:
     def __init__(self):
@@ -98,16 +96,14 @@ class OpenSearchService:
             bool_query["must_not"].extend(exclude_filters)
         if query_vector:
             bool_query["must"].append({"knn": {"vector_field": {"vector": query_vector, "k": max(10, size)}}})
-        if semantic_query and not query_vector: # semantic_query가 있고, vector가 없을 때만 multi_match 사용
+        if semantic_query and not query_vector: 
             bool_query["must"].append({"multi_match": {"query": semantic_query, "fields": ["text", "metadata.*"]}})
         
-        # bool_query에 조건이 하나라도 있을 때만 query["query"]에 할당
         if any(bool_query.values()):
             query["query"] = {"bool": bool_query}
-        else: # 아무 조건도 없으면 match_all 사용 (knn 검색 등 다른 조건이 must에 없을 경우)
-            if not query_vector : # 벡터 검색이 아닌 경우에만 match_all
+        else: 
+            if not query_vector : 
                  query["query"] = {"match_all": {}}
-
 
         if sort_options:
             query["sort"] = sort_options
@@ -149,13 +145,11 @@ def _format_board_details_to_dict(hit: Dict[str, Any]) -> Dict[str, Any]:
     source = hit["_source"]
     metadata = source.get("metadata", {})
     text_content = source.get("text", "")
-    # TITLE 필드가 메타데이터에 있을 수도 있고, text에 있을 수도 있음. 우선순위 적용.
     title_from_text = ""
     if "TITLE =>" in text_content:
         title_from_text = text_content.split("||")[0].replace("TITLE => ", "").strip()
     
     title = title_from_text if title_from_text else metadata.get("TITLE", "")
-
 
     return {
         "board_id": metadata.get("BOARD_IDX", hit.get("_id")),
@@ -171,18 +165,11 @@ def _format_board_details_to_dict(hit: Dict[str, Any]) -> Dict[str, Any]:
         "benefits": metadata.get("MEAL_HOUSE_STATUS", ""),
         "description_full": text_content,
         "description_short": (text_content[:100] + "..." if len(text_content) > 100 else text_content) if text_content else "",
-        "view_count": metadata.get("view_count") # view_count는 숫자일 것으로 가정
+        "view_count": metadata.get("view_count") 
     }
 
 @app.tool()
 async def get_board_by_id(board_id: str) -> str:
-    """
-    채용공고 ID로 특정 채용공고의 상세 정보를 조회합니다.
-    Args:
-        board_id (str): 조회할 채용공고의 고유 ID
-    Returns:
-        str: JSON 형태의 문자열로 채용공고 상세 정보 또는 오류 메시지를 포함.
-    """
     logger.info(f"도구 실행: get_board_by_id, ID: {board_id}")
     try:
         search_query = {"query": {"term": {"metadata.BOARD_IDX": board_id}}, "size": 1, "_source": {"excludes": ["vector_field"]}}
@@ -199,13 +186,6 @@ async def get_board_by_id(board_id: str) -> str:
 
 @app.tool()
 async def get_user_by_id(user_id: str) -> str:
-    """
-    사용자 ID로 특정 사용자(의료진)의 프로필 정보를 조회합니다.
-    Args:
-        user_id (str): 조회할 사용자의 고유 ID
-    Returns:
-        str: JSON 형태의 문자열로 사용자 프로필 정보 또는 오류 메시지를 포함.
-    """
     logger.info(f"도구 실행: get_user_by_id, ID: {user_id}")
     try:
         search_query = {"query": {"term": {"metadata.U_ID": user_id}}, "size": 1, "_source": {"excludes": ["vector_field"]}}
@@ -240,18 +220,6 @@ async def create_and_search_recruits(
     exclude_board_id: str = None,
     size: int = 10
 ) -> str:
-    """
-    다양한 조건으로 채용공고를 검색합니다. 필터링과 의미적 검색을 지원합니다.
-    Args:
-        region (str, optional): 지역 필터 (예: "서울", "경기도")
-        department (str, optional): 진료과/전문과목 필터 (예: "내과", "외과")
-        hospital_name (str, optional): 병원명 필터
-        semantic_keywords (str, optional): 의미적 검색을 위한 키워드
-        exclude_board_id (str, optional): 제외할 공고 ID
-        size (int, optional): 반환할 결과 수 (기본값: 10, 최대: 50)
-    Returns:
-        str: JSON 형태의 문자열로 검색 결과 또는 오류 메시지를 포함. 검색 결과에는 board_id 목록과 각 공고의 간략한 정보가 포함됩니다.
-    """
     params = locals()
     log_params = {k: v for k, v in params.items() if v is not None and k != 'semantic_keywords'}
     if semantic_keywords:
@@ -272,7 +240,6 @@ async def create_and_search_recruits(
         for hit in result["hits"]["hits"]:
             board_detail = _format_board_details_to_dict(hit)
             board_ids.append(board_detail["board_id"])
-            # LLM이 다음 단계를 위해 필요한 최소한의 정보 + 요약 정보
             formatted_results.append({
                 "board_id": board_detail["board_id"],
                 "title": board_detail["title"],
@@ -281,8 +248,8 @@ async def create_and_search_recruits(
                 "region": board_detail["region"],
                 "employment_type": board_detail["employment_type"],
                 "work_type": board_detail["work_type"],
-                "pay_details": board_detail["pay_details"], # 급여 정보는 LLM 판단에 중요할 수 있음
-                "description": board_detail["description_short"] # 간략 설명
+                "pay_details": board_detail["pay_details"], 
+                "description": board_detail["description_short"]
             })
 
         result_data = {
@@ -309,16 +276,6 @@ async def create_and_search_users(
     semantic_keywords: str = None,
     size: int = 10
 ) -> str:
-    """
-    다양한 조건으로 사용자(의료진)를 검색합니다. 필터링과 의미적 검색을 지원합니다.
-    Args:
-        department (str, optional): 전문과목 필터 (예: "내과", "외과")
-        preferred_region (str, optional): 선호 지역 필터 (예: "서울", "경기도")
-        semantic_keywords (str, optional): 의미적 검색을 위한 키워드
-        size (int, optional): 반환할 결과 수 (기본값: 10, 최대: 50)
-    Returns:
-        str: JSON 형태의 문자열로 사용자 검색 결과 또는 오류 메시지를 포함.
-    """
     params = locals()
     log_params = {k: v for k, v in params.items() if v is not None and k != 'semantic_keywords'}
     if semantic_keywords:
@@ -349,7 +306,6 @@ async def create_and_search_users(
             user_query_body["query"] = {"bool": user_query_bool_conditions}
         else:
             user_query_body["query"] = {"match_all": {}}
-
 
         result = await os_service.search("user", user_query_body)
         formatted_results = []
@@ -385,22 +341,26 @@ async def create_formatted_recommendations(
     selected_board_ids: List[str]
 ) -> str:
     """
-    LLM이 선별한 최대 5개 공고 ID 목록을 받아, 각 공고의 상세 정보를 조회하고,
-    사용자에게 보여줄 포맷팅된 추천 결과 문자열을 생성합니다.
-    선별된 공고 ID 목록은 JSON 파일로도 저장됩니다.
+    사용자의 최초 요청에 맞는 공고를 LLM이 선별한 최대 5개 ID 목록을 받아서
+    각 공고의 상세 정보를 조회하여 사용자 친화적인 텍스트 추천 목록을 생성하고,
+    그 뒤에 관련 메타데이터를 JSON 문자열 형태로 추가하여 하나의 문자열로 반환합니다.
 
     Args:
-        search_criteria (str): 원래 검색 조건/요구사항 (요약 생성에 사용).
-        selected_board_ids (List[str]): LLM이 선별한 최대 5개의 공고 ID 목록.
+        search_criteria (str): 원래 검색 조건/요구사항.
+        selected_board_ids (List[str]): 사용자 요청에 부합한 순으로 LLM이 선별한 최대 5개의 공고 ID 목록.
 
     Returns:
-        str: 포맷팅된 추천 결과 문자열 (사용자 친화적).
-             오류 발생 시, 오류 정보가 담긴 JSON 문자열 반환.
+        str: "텍스트 추천 목록\n\n<<METADATA_JSON_START>>\nJSON 메타데이터 문자열\n<<METADATA_JSON_END>>" 형태의 문자열.
+             메타데이터 JSON 예시: {"datatype": "recommendation_metadata", "board_ids": [1172181, 1172325]}
+             오류 시: {"success": false, "error": "오류 메시지"} 형태의 JSON 문자열.
     """
     logger.info(f"도구 실행: create_formatted_recommendations, 검색 조건: {search_criteria}, 선별된 ID 수: {len(selected_board_ids)}")
 
     if not selected_board_ids:
-        return json.dumps({"success": False, "error": "선별된 공고 ID가 없습니다. `selected_board_ids`는 비어있을 수 없습니다."}, ensure_ascii=False)
+        return json.dumps({
+            "success": False,
+            "error": "선별된 공고 ID가 없습니다. `selected_board_ids`는 비어있을 수 없습니다."
+        }, ensure_ascii=False)
     
     if len(selected_board_ids) > 5:
         logger.warning(f"선별된 공고 ID가 5개를 초과합니다 ({len(selected_board_ids)}개). 처음 5개만 처리합니다.")
@@ -409,44 +369,34 @@ async def create_formatted_recommendations(
         board_ids_to_process = selected_board_ids
 
     try:
-        timestamp = int(time.time())
-        filename = f"recommended_board_ids_{timestamp}.json"
-        try:
-            # 현재 작업 디렉토리에 저장
-            filepath = os.path.join(os.getcwd(), filename)
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump({
-                    "search_criteria": search_criteria,
-                    "selected_board_ids": board_ids_to_process,
-                    "timestamp": timestamp
-                }, f, ensure_ascii=False, indent=2)
-            logger.info(f"💾 선별된 Board IDs 저장됨: {filepath}")
-        except Exception as e:
-            logger.error(f"❌ 추천 ID JSON 파일 저장 오류 ({filename}): {e}")
-            filename = "저장 실패" # 파일 저장 실패 시 사용자에게 알릴 파일명
-
-        detailed_recommendations = []
+        # timestamp = int(time.time()) # 필요시 메타데이터에 추가
+        detailed_recommendations_data = []
+        actual_processed_ids = [] 
+        
         for board_id in board_ids_to_process:
-            # get_board_by_id는 JSON 문자열을 반환하므로 파싱 필요
             board_info_json_str = await get_board_by_id(board_id)
             try:
                 board_info = json.loads(board_info_json_str)
                 if board_info.get("success") and "data" in board_info:
-                    detailed_recommendations.append(board_info["data"])
+                    detailed_recommendations_data.append(board_info["data"])
+                    # board_id가 문자열일 수 있으므로 str()로 변환하여 일관성 유지
+                    if board_info["data"].get("board_id"):
+                        actual_processed_ids.append(str(board_info["data"]["board_id"])) 
                 else:
                     logger.warning(f"추천 공고 ID {board_id} 정보 조회 실패: {board_info.get('error', '알 수 없는 오류')}")
             except json.JSONDecodeError:
                 logger.error(f"공고 ID {board_id} 정보 조회 결과 JSON 파싱 실패: {board_info_json_str}")
 
+        if not detailed_recommendations_data:
+            return json.dumps({
+                "success": False,
+                "error": "선별된 공고들의 상세 정보를 조회할 수 없습니다. ID가 유효한지 확인하세요."
+            }, ensure_ascii=False)
 
-        if not detailed_recommendations:
-            return json.dumps({"success": False, "error": "선별된 공고들의 상세 정보를 조회할 수 없습니다. ID가 유효한지 확인하세요."}, ensure_ascii=False)
-
-        output_lines = [f"'{search_criteria}' 조건에 따라 다음 {len(detailed_recommendations)}개 공고를 추천합니다:"]
-        for i, r_detail in enumerate(detailed_recommendations, 1):
-            # _format_board_details_to_dict 에서 온 필드들을 사용
-            output_lines.append(f"\n🏥 {i}. {r_detail.get('title', 'N/A')} (ID: {r_detail.get('board_id', 'N/A')})")
-            output_lines.extend([
+        text_output_lines = [f"'{search_criteria}' 조건에 따라 다음 {len(detailed_recommendations_data)}개 공고를 추천합니다:"]
+        for i, r_detail in enumerate(detailed_recommendations_data, 1):
+            text_output_lines.append(f"\n🏥 {i}. {r_detail.get('title', 'N/A')} (ID: {r_detail.get('board_id', 'N/A')})")
+            text_output_lines.extend([
                 f"   - 병원: {r_detail.get('hospital_name', 'N/A')}, 지역: {r_detail.get('region', 'N/A')}",
                 f"   - 진료과: {r_detail.get('department', 'N/A')}, 고용형태: {r_detail.get('employment_type', 'N/A')}",
                 f"   - 근무유형: {r_detail.get('work_type', 'N/A')}",
@@ -454,77 +404,47 @@ async def create_formatted_recommendations(
                 f"   - 간략 설명: {r_detail.get('description_short', 'N/A')}"
             ])
         
-        formatted_output_str = "\n".join(output_lines)
-        token_count = calculate_tokens(formatted_output_str)
-        logger.info(f"📊 create_formatted_recommendations 응답 크기 - 토큰 수: {token_count}, 추천 수: {len(detailed_recommendations)}")
+        formatted_text_part = "\n".join(text_output_lines)
         
-        return f"추천 결과가 성공적으로 생성되었습니다. (저장 파일: {filename})\n\n{formatted_output_str}"
+        metadata_json_content = {
+            "datatype": "recommendation_metadata", 
+            "board_ids": actual_processed_ids,
+            # "search_criteria": search_criteria, # 필요시 추가
+            # "timestamp": timestamp # 필요시 추가
+        }
+        metadata_json_string = json.dumps(metadata_json_content, ensure_ascii=False) # indent 없이 한 줄로
+
+        final_output_string = f"{formatted_text_part}\n\n<<METADATA_JSON_START>>\n{metadata_json_string}\n<<METADATA_JSON_END>>"
+        
+        token_count = calculate_tokens(final_output_string) 
+        logger.info(f"📊 create_formatted_recommendations 전체 응답 토큰 수: {token_count}, 추천 수: {len(detailed_recommendations_data)}")
+        
+        return final_output_string
 
     except Exception as e:
         logger.error(f"create_formatted_recommendations 오류: {e}", exc_info=True)
-        return json.dumps({"success": False, "error": f"추천 생성 및 포맷팅 오류: {str(e)}"}, ensure_ascii=False)
+        return json.dumps({ 
+            "success": False,
+            "error": f"추천 생성 및 포맷팅 오류: {str(e)}"
+        }, ensure_ascii=False)
 
+"""
 @app.tool()
 async def summarize_board_by_id(board_id: str) -> str:
-    """
-    주어진 채용공고 ID에 해당하는 공고의 주요 정보를 요약하여 반환합니다.
-    Args:
-        board_id (str): 요약할 채용공고의 고유 ID.
-    Returns:
-        str: 공고의 주요 정보 요약 문자열 또는 오류 메시지.
-    """
-    logger.info(f"도구 실행: summarize_board_by_id, ID: {board_id}")
-    try:
-        board_info_json_str = await get_board_by_id(board_id)
-        board_info = json.loads(board_info_json_str)
-
-        if not board_info.get("success") or "data" not in board_info:
-            return f"공고 ID {board_id} 정보를 가져오는데 실패했습니다: {board_info.get('error', '데이터 없음')}"
-
-        data = board_info["data"]
-        summary_parts = [
-            f"'{data.get('title', '제목 없음')}' 공고(ID: {data.get('board_id')}) 요약:",
-            f"- 병원명: {data.get('hospital_name', '정보 없음')}",
-            f"- 지역: {data.get('region', '정보 없음')}",
-            f"- 진료과: {data.get('department', '정보 없음')}",
-            f"- 고용형태: {data.get('employment_type', '정보 없음')}",
-            f"- 실제 근무유형: {data.get('work_type', '정보 없음')}",
-        ]
-        if data.get('pay_details'): # 급여 정보가 있을 때만 추가
-            summary_parts.append(f"- 급여: {data.get('pay_details')}")
-        summary_parts.append(f"- 주요 내용: {data.get('description_short', '정보 없음')}")
-        
-        summary = "\n".join(summary_parts)
-        logger.info(f"summarize_board_by_id 성공: ID {board_id}")
-        return summary
-    except json.JSONDecodeError:
-        logger.error(f"공고 ID {board_id} 정보 조회 결과 JSON 파싱 실패 (summarize_board_by_id): {board_info_json_str}")
-        return f"공고 ID {board_id} 정보 처리 중 오류가 발생했습니다 (파싱 실패)."
-    except Exception as e:
-        logger.error(f"summarize_board_by_id 오류: {e}", exc_info=True)
-        return f"공고 요약 중 오류 발생: {str(e)}"
-
+    # ... (이 함수는 현재 주석 처리되어 있음) ...
+"""
 @app.tool()
 async def recommend_popular_jobs(user_id: Optional[str] = None, size: int = 5) -> str:
-    """
-    인기 있는 채용공고를 추천합니다. 사용자 ID가 제공되면 해당 사용자의 전문과를 고려하여 추천합니다.
-    인기 순서는 가상의 'metadata.view_count' 필드를 기준으로 합니다. (실제 필드명 및 타입 확인 필요)
-    Args:
-        user_id (str, optional): 사용자 ID. 제공되면 사용자의 전문과를 필터 조건으로 사용합니다.
-        size (int, optional): 추천할 공고 수 (기본값: 5).
-    Returns:
-        str: 인기 공고 추천 목록 문자열 또는 오류 메시지.
-    """
     logger.info(f"도구 실행: recommend_popular_jobs, 사용자 ID: {user_id}, 개수: {size}")
     try:
         filters = {}
         user_department_for_log = "전체"
         if user_id:
             user_info_json_str = await get_user_by_id(user_id)
-            user_info = json.loads(user_info_json_str)
+            user_info = json.loads(user_info_json_str) 
             if user_info.get("success") and user_info["data"].get("department"):
                 user_department = user_info["data"]["department"]
-                if user_department: # 전문과 정보가 실제로 있을 때만 필터 추가
+                if user_department: 
                     filters["department"] = user_department
                     user_department_for_log = user_department
                     logger.info(f"사용자 {user_id}의 전문과 '{user_department}' 기준으로 인기 공고 검색")
@@ -533,12 +453,11 @@ async def recommend_popular_jobs(user_id: Optional[str] = None, size: int = 5) -
             else:
                 logger.warning(f"사용자 ID {user_id}의 프로필 또는 전문과 정보를 가져오지 못했습니다. 전체 인기 공고를 검색합니다.")
         
-        # 'metadata.view_count' 필드가 숫자 타입이고 존재한다고 가정.
         sort_options = [{"metadata.view_count": {"order": "desc", "missing": "_last", "unmapped_type": "long"}}]
 
         query = os_service.build_search_query(
             index_hint="recruit",
-            filters=filters, # department 필터 적용
+            filters=filters, 
             size=min(size, 20),
             sort_options=sort_options
         )
@@ -546,7 +465,7 @@ async def recommend_popular_jobs(user_id: Optional[str] = None, size: int = 5) -
         result = await os_service.search("recruit", query)
 
         if not result["hits"]["hits"]:
-            return f"{user_department_for_log} 분야에서 추천할 인기 공고를 찾을 수 없습니다."
+            return f"{user_department_for_log} 분야에서 추천할 인기 공고를 찾을 수 없습니다." # 일반 텍스트 반환
 
         output_lines = [f"'{user_department_for_log}' 분야의 인기 채용공고 {len(result['hits']['hits'])}개를 추천합니다:"]
         for i, hit in enumerate(result['hits']['hits'], 1):
@@ -557,28 +476,26 @@ async def recommend_popular_jobs(user_id: Optional[str] = None, size: int = 5) -
             output_lines.extend([
                 f"   - 병원: {board_detail.get('hospital_name', 'N/A')}, 지역: {board_detail.get('region', 'N/A')}",
                 f"   - 진료과: {board_detail.get('department', 'N/A')}",
-                # view_count가 실제로 숫자일 때만 의미있게 표시
                 f"   - 인기도(조회수): {board_detail.get('view_count', '정보 없음') if isinstance(board_detail.get('view_count'), int) else '집계 중'}"
             ])
         
         logger.info(f"recommend_popular_jobs 성공: {len(result['hits']['hits'])}개 공고 추천 (분야: {user_department_for_log})")
-        return "\n".join(output_lines)
+        return "\n".join(output_lines) # 일반 텍스트 반환
 
     except opensearch_exceptions.RequestError as e:
-        # OpenSearch 에러 메시지에 따라 더 구체적인 사용자 안내 가능
         if "Field [metadata.view_count] is not a numeric type" in str(e) or \
            "No mapping found for [metadata.view_count]" in str(e) or \
            "can't load numeric doc values" in str(e):
-             logger.error(f"인기 공고 추천 오류: 'metadata.view_count' 필드로 정렬할 수 없습니다. 필드가 없거나 숫자 타입이 아닐 수 있습니다. OpenSearch 매핑을 확인하세요. 에러: {e}", exc_info=False)
-             return "인기 공고를 조회하는 중 문제가 발생했습니다. (인기 지표 설정 오류). 관리자에게 문의하세요."
+             logger.error(f"인기 공고 추천 오류: 'metadata.view_count' 필드로 정렬할 수 없습니다. OpenSearch 매핑을 확인하세요. 에러: {e}", exc_info=False)
+             return "인기 공고를 조회하는 중 문제가 발생했습니다. (인기 지표 설정 오류). 관리자에게 문의하세요." 
         logger.error(f"recommend_popular_jobs OpenSearch 요청 오류: {e}", exc_info=True)
-        return f"인기 공고 추천 중 OpenSearch 오류 발생: {str(e)}"
-    except json.JSONDecodeError as e:
+        return f"인기 공고 추천 중 OpenSearch 오류 발생: {str(e)}" 
+    except json.JSONDecodeError as e: 
         logger.error(f"recommend_popular_jobs 사용자 정보 파싱 오류: {e}", exc_info=True)
-        return "사용자 정보를 처리하는 중 오류가 발생했습니다."
+        return "사용자 정보를 처리하는 중 오류가 발생했습니다." 
     except Exception as e:
         logger.error(f"recommend_popular_jobs 일반 오류: {e}", exc_info=True)
-        return f"인기 공고 추천 중 알 수 없는 오류 발생: {str(e)}"
+        return f"인기 공고 추천 중 알 수 없는 오류 발생: {str(e)}" 
 
 if __name__ == "__main__":
     app.run(transport="stdio")
